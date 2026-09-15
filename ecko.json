@@ -1,0 +1,13 @@
+{
+  "module": "github.com/ecko-lang/clipboard",
+  "version": "0.27.0",
+  "entrypoint": "main.ecko",
+  "description": "Read and write the OS clipboard by driving the platform's own tool: pbcopy on macOS, clip on Windows, wl-copy or xclip on Linux.",
+  "author": "Sean Nieuwoudt <sean@underwulf.com>",
+  "license": "MIT",
+  "capabilities": [
+    "exec",
+    "env"
+  ],
+  "dependencies": {}
+}

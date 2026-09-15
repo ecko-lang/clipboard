@@ -1,0 +1,22 @@
+# clipboard demo. Degrades politely where there is no clipboard, so it runs
+# anywhere - including CI, where there is no display server.
+#
+#   ecko example.ecko
+
+import "./main.ecko" as clipboard
+
+unless clipboard.available() {
+    print("No clipboard here. On Linux install wl-copy, xclip or xsel.")
+    print("backend(): " + string(clipboard.backend()))
+    return
+}
+
+print("backend: " + clipboard.backend())
+
+clipboard.copy("Ecko was here")
+print("copied, read back: " + clipboard.paste())
+
+# The point of the package: pipe an answer straight to the clipboard.
+answer = ai "Name one benefit of typed AI output, in under ten words"
+clipboard.copy(answer)
+print("the model's answer is now on your clipboard")

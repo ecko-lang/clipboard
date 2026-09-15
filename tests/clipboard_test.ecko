@@ -1,0 +1,78 @@
+# Tests for clipboard backend selection.
+#
+# The clipboard itself is not testable offline: it needs a display server, and
+# CI has none. What is testable, and what actually goes wrong, is the choice of
+# tool - so `candidates` takes the session as parameters rather than reading the
+# environment, and these drive it directly.
+#
+# The bug that motivated this shape: `wl-copy` installed on a machine with no
+# Wayland compositor. It is on PATH, so choosing by PATH alone picks it, and it
+# fails at the socket rather than being absent.
+
+import std.test
+import "../backends.ecko"
+
+# --- platform ------------------------------------------------------------------
+
+test.case("macOS and Windows use the tool they ship", fn() {
+    test.eq(backends.candidates("macos", false, false), ["pbcopy"])
+    test.eq(backends.candidates("windows", false, false), ["clip"])
+})
+
+test.case("the shipped tools do not depend on a display variable", fn() {
+    # A macOS or Windows session sets neither, and must still work.
+    test.eq(backends.candidates("macos", false, false), backends.candidates("macos", true, true))
+    test.eq(
+        backends.candidates("windows", false, false),
+        backends.candidates("windows", true, true),
+    )
+})
+
+# --- linux, where the session decides -------------------------------------------
+
+test.case("a Wayland session prefers wl-copy", fn() {
+    test.eq(first(backends.candidates("linux", true, false)), "wl-copy")
+})
+
+test.case("Wayland wins even when X11 is also present", fn() {
+    # XWayland means both are set. xclip appears to work there and writes to a
+    # clipboard the compositor's own applications never read.
+    test.eq(first(backends.candidates("linux", true, true)), "wl-copy")
+})
+
+test.case("an X11 session never offers wl-copy", fn() {
+    got = backends.candidates("linux", false, true)
+    test.eq(first(got), "xclip")
+    test.ok(
+        not contains(got, "wl-copy"),
+        "wl-copy cannot work without a compositor: " + string(got),
+    )
+})
+
+test.case("no display server means no candidates at all", fn() {
+    # A server over ssh with no X forwarding. Better to say so than to pick a
+    # tool that will fail at the socket.
+    test.eq(backends.candidates("linux", false, false), [])
+    test.eq(backends.candidates("freebsd", false, false), [])
+})
+
+# --- the tables -----------------------------------------------------------------
+
+test.case("every backend can both copy and paste", fn() {
+    for name in keys(backends.COPY) {
+        test.ok(not is_null(get(backends.PASTE, name)), "no paste command for " + name)
+    }
+    for name in keys(backends.PASTE) {
+        test.ok(not is_null(get(backends.COPY, name)), "no copy command for " + name)
+    }
+})
+
+test.case("every candidate a platform names has a command", fn() {
+    for p in ["macos", "windows", "linux"] {
+        for name in backends.candidates(p, true, true) {
+            b = get(backends.COPY, name)
+            test.ok(not is_null(b), p + " names an unknown backend: " + name)
+            test.ok(len(b.cmd) > 0, "empty command for " + name)
+        }
+    }
+})

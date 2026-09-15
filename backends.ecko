@@ -1,0 +1,65 @@
+# clipboard/backends - which tool to drive, per platform.
+#
+# Kept apart from the verbs that run it so the choice is testable without a
+# clipboard, a display, or any of those tools installed. Everything here is a
+# pure function of the platform name and what is on PATH.
+
+import std.os
+
+## COPY and PASTE name the command and arguments for each backend.
+##
+## macOS and Windows ship theirs, so those always work. Linux ships neither:
+## the clipboard lives in the display server, and talking to it needs a tool
+## that speaks X11 or Wayland.
+export COPY = {
+    pbcopy: { cmd: "pbcopy", args: [] },
+    clip: { cmd: "clip", args: [] },
+    "wl-copy": { cmd: "wl-copy", args: [] },
+    xclip: { cmd: "xclip", args: ["-selection", "clipboard"] },
+    xsel: { cmd: "xsel", args: ["--clipboard", "--input"] },
+}
+
+export PASTE = {
+    pbcopy: { cmd: "pbpaste", args: [] },
+    clip: { cmd: "powershell", args: ["-NoProfile", "-Command", "Get-Clipboard"] },
+    "wl-copy": { cmd: "wl-paste", args: ["--no-newline"] },
+    xclip: { cmd: "xclip", args: ["-selection", "clipboard", "-o"] },
+    xsel: { cmd: "xsel", args: ["--clipboard", "--output"] },
+}
+
+## candidates(platform, wayland, x11) -> the backends worth trying, best first.
+##
+## `wayland` and `x11` say which display server this session actually has, and
+## they matter more than what is installed. A machine can carry `wl-copy` with
+## no Wayland compositor running, and it fails at the socket rather than being
+## absent - so choosing on PATH alone picks a tool that cannot work. They are
+## parameters rather thanenvironment reads so this stays a pure function.
+##
+## Wayland comes before X11 because a Wayland session usually also runs
+## XWayland: `xclip` appears to work there and writes to a clipboard the
+## compositor's own applications never read.
+export fn candidates(platform, wayland, x11) {
+    if platform == "macos" {
+        ["pbcopy"]
+    } else if platform == "windows" {
+        ["clip"]
+    } else if wayland {
+        ["wl-copy", "xclip", "xsel"]
+    } else if x11 {
+        ["xclip", "xsel"]
+    } else {
+        []
+    }
+}
+
+## on_path(cmd) -> whether the command can be run.
+##
+## Asks the shell rather than reading PATH, so a shell function or an alias
+## resolves the same way it would when we actually run it.
+export fn on_path(cmd) {
+    if os.family() == "windows" {
+        os.exec("where", [cmd]).code == 0
+    } else {
+        os.exec("sh", ["-c", "command -v " + cmd]).code == 0
+    }
+}

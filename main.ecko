@@ -1,0 +1,103 @@
+# clipboard - read and write the OS clipboard.
+#
+#   import clipboard
+#
+#   clipboard.copy("hello")
+#   clipboard.paste()          # "hello"
+#
+# It drives the platform's own tool rather than talking to the display server
+# directly, and that is deliberate rather than lazy. On X11 the clipboard lives
+# in the *owning process*: whoever set it must stay alive to serve it, so a
+# program that writes and exits leaves an empty clipboard behind. `xclip` and
+# `wl-copy` already fork a holder to solve this. Linking a clipboard library
+# instead would mean either keeping the interpreter alive after your program
+# ended, or shipping a daemon - and on Linux it would add X11 and Wayland
+# libraries to a binary that is otherwise self-contained.
+#
+# What that costs: on Linux one of `wl-copy`, `xclip` or `xsel` must be
+# installed. macOS and Windows ship theirs. `available()` tells you which
+# situation you are in without raising, and a failed `copy` or `paste` names
+# the package to install.
+
+import std.os
+import std.proc
+import std.io
+import "./backends.ecko"
+
+fail = fn(message) error({ kind: "clipboard", message: message })
+
+# The first backend on this platform whose tool is actually installed.
+fn chosen() {
+    wayland = not is_null(os.env("WAYLAND_DISPLAY"))
+    x11 = not is_null(os.env("DISPLAY"))
+    mut found = null
+    for name in backends.candidates(os.platform(), wayland, x11) {
+        if is_null(found) and backends.on_path(get(backends.COPY, name).cmd) { found = name }
+    }
+    found
+}
+
+fn no_backend_error() {
+    if os.platform() == "linux" {
+        fail(
+            "no clipboard tool found. Install one of: wl-copy (wl-clipboard) on Wayland, " +
+                "or xclip or xsel on X11. Linux has no clipboard without a display server tool.",
+        )
+    } else { fail("no clipboard tool found for platform '" + os.platform() + "'") }
+}
+
+## backend() -> the tool this machine would use, or null when there is none.
+##
+## Useful in a diagnostic or a bug report: "xclip" and "wl-copy" behave
+## differently under a Wayland session running XWayland, and knowing which one
+## answered explains a clipboard that seems to write but never paste.
+export fn backend() = chosen()
+
+## available() -> whether copy and paste will work here.
+##
+## Answers `false` rather than raising, so a program can degrade politely -
+## print the text instead of copying it - rather than wrapping every call in
+## `try`.
+export fn available() = not is_null(chosen())
+
+## copy(text) -> null, having put `text` on the clipboard.
+##
+## Raises kind `clipboard` when no tool is installed, naming what to install.
+##
+## example:
+##   clipboard.copy("hello")
+export fn copy(text) {
+    name = chosen()
+    if is_null(name) { return no_backend_error() }
+    b = get(backends.COPY, name)
+    p = proc.spawn(b.cmd, b.args)
+    io.write(proc.stdin(p), string(text))
+    io.close(proc.stdin(p))
+    # `proc.wait` answers a result map, or null if the tool is somehow still
+    # running after the deadline.
+    r = proc.wait(p, 5000)
+    if is_null(r) { return fail(b.cmd + " did not finish within 5s") }
+    unless r.code == 0 { return fail(b.cmd + " failed writing the clipboard: " + trim(r.stderr)) }
+    null
+}
+
+## paste() -> the clipboard's contents as text, or "" when it is empty.
+##
+## Raises kind `clipboard` when no tool is installed.
+##
+## example:
+##   clipboard.paste()
+export fn paste() {
+    name = chosen()
+    if is_null(name) { return no_backend_error() }
+    b = get(backends.PASTE, name)
+    r = os.exec(b.cmd, b.args)
+    # An empty X11 clipboard makes xclip exit non-zero with "target STRING not
+    # available" rather than answering nothing, so that is emptiness, not
+    # failure. A real failure has something on stderr worth repeating.
+    unless r.code == 0 {
+        if contains(r.stderr, "target") or trim(r.stderr) == "" { return "" }
+        return fail(b.cmd + " failed: " + trim(r.stderr))
+    }
+    r.stdout
+}
