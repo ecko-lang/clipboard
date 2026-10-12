@@ -23,10 +23,10 @@ session is identified.
 import clipboard
 
 clipboard.copy("hello")
-clipboard.paste()            # "hello"
+clipboard.paste()  # "hello"
 
-clipboard.available()        # false on a machine with no clipboard tool
-clipboard.backend()          # "xclip", "wl-copy", "pbcopy", "clip", or null
+clipboard.available()  # false on a machine with no clipboard tool
+clipboard.backend()  # "xclip", "xsel", "wl-copy", "pbcopy", "clip", or null
 ```
 
 The reason this package exists, rather than printing and letting you select:
