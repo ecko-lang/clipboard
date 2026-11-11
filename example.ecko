@@ -6,8 +6,9 @@
 import "./main.ecko" as clipboard
 
 unless clipboard.available() {
-    print("No clipboard here. On Linux install wl-copy, xclip or xsel.")
-    print("backend(): " + string(clipboard.backend()))
+    # paste() raises the reason: no display server, or no tool installed.
+    why = try { clipboard.paste() } catch (e) { get(e, "message") }
+    print("No clipboard here: " + string(why))
     return
 }
 

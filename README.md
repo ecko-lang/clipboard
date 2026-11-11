@@ -1,7 +1,8 @@
-# Clipboard - Ecko Std Lib Package
+# clipboard
 
 Read and write the OS clipboard, so a terminal workflow can hand its answer
-straight to whatever you paste into next.
+straight to whatever you paste into next. Needs `exec` and `env`; grant them
+when you import the package.
 
 ## Install
 
@@ -9,70 +10,77 @@ straight to whatever you paste into next.
 ecko get github.com/ecko-lang/clipboard
 ```
 
-```ecko
-import clipboard
+`ecko get` writes a dependency with no grant. Give the entry both
+capabilities in your `ecko.json`: `exec` to run the clipboard tool, and `env`
+to read `DISPLAY` and `WAYLAND_DISPLAY`, which is how the session is
+identified.
+
+```json
+"dependencies": {
+  "clipboard": { "path": "github.com/ecko-lang/clipboard", "version": "0.38.0", "grant": ["exec", "env"] }
+}
 ```
 
-Needs Ecko 0.23.0 or later, and two capabilities: `exec` to run the clipboard
-tool, and `env` to read `DISPLAY` and `WAYLAND_DISPLAY`, which is how the
-session is identified.
+```ecko norun
+import clipboard   # granted exec and env in ecko.json
+```
 
 ## Usage
 
-```ecko
-import clipboard
+```ecko norun
+import clipboard   # granted exec and env in ecko.json
+
+print(clipboard.available())  # true  (false where there is no clipboard)
+print(clipboard.backend())  # xclip  ("wl-copy", "xsel", "pbcopy", "clip", or null)
 
 clipboard.copy("hello")
-clipboard.paste()  # "hello"
+print(clipboard.paste())  # hello
 
-clipboard.available()  # false on a machine with no clipboard tool
-clipboard.backend()  # "xclip", "xsel", "wl-copy", "pbcopy", "clip", or null
-```
-
-The reason this package exists, rather than printing and letting you select:
-
-```ecko
-answer = ai "Summarise this error in one line: {log}"
-clipboard.copy(answer)
-```
-
-## On Linux you need a tool installed
-
-macOS and Windows ship theirs, so `copy` and `paste` always work. Linux ships
-neither: the clipboard lives in the display server, and reaching it needs
-`wl-copy` (from `wl-clipboard`) on Wayland, or `xclip` or `xsel` on X11.
-
-`available()` answers `false` rather than raising, so a program can degrade
-politely instead of wrapping every call in `try`:
-
-```ecko
+# The reason this package exists: hand an answer straight to the clipboard,
+# and degrade politely where there is none.
+answer = ai "Summarise this error in one line: connection refused"
 if clipboard.available() {
     clipboard.copy(answer)
+    print("copied")
 } else {
     print(answer)
 }
 ```
 
-A `copy` or `paste` with nothing installed raises kind `clipboard` and names
-what to install.
+These blocks are marked `norun`: they need a display and they would overwrite
+your clipboard.
 
-## Why it drives a tool instead of talking to the display server
+## API
 
-On X11 the clipboard content lives in the **owning process**. Whoever set it
-must stay alive to serve it, so a program that writes and exits leaves an empty
-clipboard behind. `xclip` and `wl-copy` already fork a holder to solve exactly
-this.
+| function | returns |
+|---|---|
+| `copy(text)` | `null`, having put the String `text` on the clipboard |
+| `paste()` | the clipboard's contents as a String, or `""` when it is empty |
+| `available()` | whether copy and paste will work here, as a Bool; never raises |
+| `backend()` | the tool this machine would use, or `null` |
 
-Linking a clipboard library instead would mean either keeping the interpreter
-alive after your program ended, or shipping a daemon, and on Linux it would add
-X11 and Wayland libraries to a binary that is otherwise self-contained. Driving
-the tool that already solved the problem is the smaller answer.
+## Notes
 
-It also keeps this a Layer 3 package rather than something in `ecko-std`: it is
-expressible over `os.exec` and `std.proc`, which is the bar for staying out of
-the core.
+### Errors
 
-## Which backend gets chosen
+| kind | reason | when |
+|---|---|---|
+| `clipboard` | `no_display` | a Linux (or BSD) session has neither `WAYLAND_DISPLAY` nor `DISPLAY` set, or they are empty |
+| `clipboard` | `no_tool` | there is a display but no clipboard tool is installed; the message names what to install |
+| `clipboard` | `tool_failed` | the tool exits non-zero for a reason other than an empty clipboard; the message carries its stderr or exit code |
+| `clipboard` | `timeout` | the tool does not finish within 5 seconds; it is killed |
+| `bug` | `bad_argument` | `copy` is given something that is not a String, a secret included |
+
+`copy(secret(...))` is refused rather than copying the text `[secret]`; copy a
+secret with `clipboard.copy(reveal(s))`, deliberately.
+
+### On Linux you need a tool installed
+
+macOS and Windows ship theirs. Linux ships neither: the clipboard lives in the
+display server, and reaching it needs `wl-copy` (from `wl-clipboard`) on
+Wayland, or `xclip` or `xsel` on X11.
+
+### Which backend gets chosen
 
 The **session** decides, not what happens to be installed. A machine can carry
 `wl-copy` with no Wayland compositor running, where it fails at the socket
@@ -81,7 +89,7 @@ work.
 
 | session | order tried |
 |---|---|
-| macOS | `pbcopy` |
+| macOS | `pbcopy` (and `pbpaste` to read) |
 | Windows | `clip`, and PowerShell `Get-Clipboard` to read |
 | Wayland (`WAYLAND_DISPLAY` set) | `wl-copy`, then `xclip`, then `xsel` |
 | X11 only (`DISPLAY` set) | `xclip`, then `xsel` |
@@ -91,25 +99,29 @@ Wayland is tried before X11 because a Wayland session usually also runs
 XWayland. `xclip` appears to work there, and writes to a clipboard the
 compositor's own applications never read.
 
-## API
+An empty clipboard reads as `""`: xclip's "target STRING not available" and
+wl-paste's "Nothing is copied" are recognised as emptiness. Any other failure
+raises. On Windows the line break PowerShell adds after the text is removed.
 
-| call | what it does |
-|---|---|
-| `copy(text)` | Put `text` on the clipboard. Raises kind `clipboard` if no tool is installed. |
-| `paste()` | The clipboard's contents, or `""` when empty. |
-| `available()` | Whether copy and paste will work here. Never raises. |
-| `backend()` | The tool this machine would use, or `null`. Useful in a bug report. |
+### Why it drives a tool instead of talking to the display server
+
+On X11 the clipboard content lives in the **owning process**. Whoever set it
+must stay alive to serve it, so a program that writes and exits leaves an empty
+clipboard behind. `xclip` and `wl-copy` already fork a holder to solve exactly
+this. Linking a clipboard library instead would mean keeping the interpreter
+alive after your program ended, or shipping a daemon, and on Linux it would add
+X11 and Wayland libraries to a binary that is otherwise self-contained.
 
 ## Testing
 
 ```bash
-ecko test tests/
+ecko test
 ```
 
-The tests cover backend selection, which is where this actually goes wrong. The
-clipboard itself needs a display server, so it is exercised by `example.ecko`
-rather than by the offline suite.
+The tests never touch your clipboard: they put a fake `xclip` alone on `PATH`
+and drive `copy` and `paste` against it, including its failures and a tool
+that hangs (that case waits out the 5-second deadline twice).
 
 ## License
 
-MIT
+[MIT](LICENSE)

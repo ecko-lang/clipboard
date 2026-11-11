@@ -1,0 +1,148 @@
+# Tests for copy, paste and backend selection against fake clipboard tools.
+#
+# Nothing here touches the real clipboard. Each case builds a directory holding
+# a fake `xclip` (plus `sh`, `cat` and `sleep` linked from the system) and makes
+# that directory the whole of PATH, so the real `xclip`, `xsel` and `wl-copy`
+# cannot be found. The fake keeps what it is given in a file beside it and
+# behaves as the `behaviour` file there says: ok, empty, fail, silentfail, slow.
+
+import std.fs
+import std.os
+import std.test
+import "../main.ecko" as clipboard
+
+FAKE_XCLIP = r"""#!/bin/sh
+D="${0%/*}"
+b=$(cat "$D/behaviour")
+if [ "$3" = "-o" ]; then
+  case $b in
+    ok) cat "$D/store" ;;
+    empty) echo "Error: target STRING not available" >&2; exit 1 ;;
+    fail) echo "Error: Can't open display: :9" >&2; exit 1 ;;
+    silentfail) exit 3 ;;
+    slow) sleep 30 ;;
+  esac
+else
+  case $b in
+    ok) cat > "$D/store" ;;
+    fail) cat > /dev/null; echo "Error: Can't open display: :9" >&2; exit 1 ;;
+    silentfail) cat > /dev/null; exit 3 ;;
+    slow) sleep 30 ;;
+  esac
+fi
+"""
+
+# The real location of a system tool, found before PATH is replaced.
+fn system_tool(name) = trim(os.exec("sh", ["-c", "command -v " + name]).stdout)
+
+TOOLS = if os.family() == "windows" {
+    {}
+} else {
+    { sh: system_tool("sh"), cat: system_tool("cat"), sleep: system_tool("sleep") }
+}
+
+mut counter = 0
+
+# A fresh fake-tool directory, made the whole of PATH, in an X11-only session.
+fn fake_session(behaviour, tools = ["xclip"]) {
+    if os.family() == "windows" { test.skip("fake tools are shell scripts") }
+    counter += 1
+    dir = fs.join(fs.temp_dir(), "clipboard-fake-" + string(counter))
+    fs.mkdir(dir)
+    for (name, target) in TOOLS {
+        fs.symlink(target, fs.join(dir, name))
+    }
+    for t in tools {
+        fs.write(fs.join(dir, t), FAKE_XCLIP)
+        fs.chmod(fs.join(dir, t), "755")
+    }
+    fs.write(fs.join(dir, "behaviour"), behaviour)
+    os.set_env("PATH", dir)
+    os.set_env("DISPLAY", ":9")
+    os.unset_env("WAYLAND_DISPLAY")
+    dir
+}
+
+fn caught(f) = try {
+    f()
+    null
+} catch (e) { e }
+
+fn fails(f, kind, reason) {
+    e = caught(f)
+    test.ok(not is_null(e), "expected a {kind}/{reason} error, got none")
+    test.eq(get(e, "kind"), kind)
+    test.eq(get(e, "reason"), reason)
+    e
+}
+
+test.case("the fake tool is the only one on PATH", fn() {
+    fake_session("ok")
+    test.eq(clipboard.backend(), "xclip")
+    test.ok(clipboard.available(), "available with the fake xclip")
+})
+
+test.case("copy then paste round-trips text, unicode included", fn() {
+    dir = fake_session("ok")
+    clipboard.copy("hello, 世界")
+    test.eq(fs.read(fs.join(dir, "store")), "hello, 世界")
+    test.eq(clipboard.paste(), "hello, 世界")
+    clipboard.copy("")
+    test.eq(clipboard.paste(), "")
+})
+
+test.case("xclip's empty-clipboard error is an empty clipboard", fn() {
+    fake_session("empty")
+    test.eq(clipboard.paste(), "")
+})
+
+test.case("a failing tool is an error, not an empty clipboard", fn() {
+    fake_session("fail")
+    e = fails(fn() clipboard.paste(), "clipboard", "tool_failed")
+    test.ok(contains(e.message, "open display"), e.message)
+    fails(fn() clipboard.copy("x"), "clipboard", "tool_failed")
+})
+
+test.case("a tool failing with nothing on stderr is still an error", fn() {
+    fake_session("silentfail")
+    e = fails(fn() clipboard.paste(), "clipboard", "tool_failed")
+    test.ok(contains(e.message, "3"), "names the exit code: " + e.message)
+    fails(fn() clipboard.copy("x"), "clipboard", "tool_failed")
+})
+
+test.case("a hung tool times out on copy and on paste", fn() {
+    fake_session("slow")
+    e = fails(fn() clipboard.copy("x"), "clipboard", "timeout")
+    test.ok(contains(e.message, "5s"), e.message)
+    fails(fn() clipboard.paste(), "clipboard", "timeout")
+})
+
+test.case("no display is reported as no display, not as a missing tool", fn() {
+    fake_session("ok")
+    os.unset_env("DISPLAY")
+    test.ok(not clipboard.available(), "no display, not available")
+    test.eq(clipboard.backend(), null)
+    e = fails(fn() clipboard.paste(), "clipboard", "no_display")
+    test.ok(not contains(e.message, "Install"), e.message)
+})
+
+test.case("an empty DISPLAY is no display", fn() {
+    fake_session("ok")
+    os.set_env("DISPLAY", "")
+    test.ok(not clipboard.available(), "DISPLAY= is not an X11 session")
+    fails(fn() clipboard.copy("x"), "clipboard", "no_display")
+})
+
+test.case("a display with no tool names what to install", fn() {
+    fake_session("ok", [])
+    e = fails(fn() clipboard.copy("x"), "clipboard", "no_tool")
+    test.ok(contains(e.message, "xclip"), e.message)
+})
+
+test.case("copy refuses what is not text, at the boundary", fn() {
+    fake_session("ok")
+    for v in [null, 42, b"\x00\xff", secret("pw")] {
+        e = fails(fn() clipboard.copy(v), "bug", "bad_argument")
+        test.ok(contains(e.message, "clipboard.copy"), e.message)
+    }
+})

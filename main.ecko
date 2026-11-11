@@ -24,80 +24,174 @@ import std.proc
 import std.io
 import "./backends.ecko"
 
-fail = fn(message) error({ kind: "clipboard", message: message })
+# How long a clipboard tool may take before it is killed and the call fails.
+DEADLINE_MS = 5000
+
+# A failure of the clipboard or its tool: kind `clipboard`.
+fn fail(reason, message) = error({ kind: "clipboard", reason: reason, message: message })
+
+# An environment variable that is set and not empty: `DISPLAY=` is no display.
+fn env_set(name) {
+    v = os.env(name)
+    not is_null(v) and trim(v) != ""
+}
+
+fn has_display() = env_set("WAYLAND_DISPLAY") or env_set("DISPLAY")
+
+# Whether this platform keeps its clipboard in a display server.
+fn needs_display() = not contains(["macos", "windows"], os.platform())
 
 # The first backend on this platform whose tool is actually installed.
 fn chosen() {
-    wayland = not is_null(os.env("WAYLAND_DISPLAY"))
-    x11 = not is_null(os.env("DISPLAY"))
     mut found = null
-    for name in backends.candidates(os.platform(), wayland, x11) {
+    for name in backends.candidates(os.platform(), env_set("WAYLAND_DISPLAY"), env_set("DISPLAY")) {
         if is_null(found) and backends.on_path(get(backends.COPY, name).cmd) { found = name }
     }
     found
 }
 
-fn no_backend_error() {
-    if os.platform() == "linux" {
+# The backend to use, or the error saying why there is none.
+fn require(fname) {
+    name = chosen()
+    unless is_null(name) { return name }
+    if needs_display() and not has_display() {
         fail(
-            "no clipboard tool found. Install one of: wl-copy (wl-clipboard) on Wayland, " +
-                "or xclip or xsel on X11. Linux has no clipboard without a display server tool.",
+            "no_display",
+            "clipboard." +
+                fname +
+                ": this session has no display server (neither WAYLAND_DISPLAY nor DISPLAY " +
+                "is set), so there is no clipboard to reach. Over SSH, forward X11 (`ssh -X`) or run inside the " +
+                "desktop session.",
         )
-    } else { fail("no clipboard tool found for platform '" + os.platform() + "'") }
+    }
+    if os.platform() == "linux" or needs_display() {
+        fail(
+            "no_tool",
+            "clipboard." +
+                fname +
+                ": no clipboard tool found. Install one of: wl-copy (wl-clipboard) on Wayland, " +
+                "or xclip or xsel on X11.",
+        )
+    }
+    fail(
+        "no_tool",
+        "clipboard." + fname + ": no clipboard tool found for platform '" + os.platform() + "'.",
+    )
 }
 
-## backend() -> the tool this machine would use, or null when there is none.
+# The reason a tool's result says it failed, as text for an error message.
+fn why(r) {
+    detail = trim(r.stderr)
+    if detail == "" {
+        "exited with code " + string(r.code) + " and printed nothing"
+    } else {
+        detail
+    }
+}
+
+## The tool this machine would use (`"wl-copy"`, `"xclip"`, `"xsel"`, `"pbcopy"` or `"clip"`), or `null` when there is none.
 ##
 ## Useful in a diagnostic or a bug report: "xclip" and "wl-copy" behave
 ## differently under a Wayland session running XWayland, and knowing which one
-## answered explains a clipboard that seems to write but never paste.
+## answered explains a clipboard that seems to write but never paste. Needs
+## `exec` and `env`.
+##
+## example:
+##   clipboard.backend()   # "xclip"
 export fn backend() = chosen()
 
-## available() -> whether copy and paste will work here.
+## Whether copy and paste will work here, as a Bool.
 ##
 ## Answers `false` rather than raising, so a program can degrade politely -
 ## print the text instead of copying it - rather than wrapping every call in
-## `try`.
+## `try`. Needs `exec` and `env`.
+##
+## example:
+##   if clipboard.available() { clipboard.copy(answer) } else { print(answer) }
 export fn available() = not is_null(chosen())
 
-## copy(text) -> null, having put `text` on the clipboard.
+## Puts `text` on the clipboard and returns `null`.
 ##
-## Raises kind `clipboard` when no tool is installed, naming what to install.
+## The tool gets 5 seconds; past that it is killed and the call fails.
+## Needs `exec` and `env`.
+##
+## errors: `clipboard`/`no_display` when a Linux session has no display server; `clipboard`/`no_tool` when no clipboard tool is installed; `clipboard`/`tool_failed` when the tool exits non-zero; `clipboard`/`timeout` when it does not finish in 5 seconds; `bug`/`bad_argument` when `text` is not a String (a secret must be revealed first, deliberately).
 ##
 ## example:
 ##   clipboard.copy("hello")
 export fn copy(text) {
-    name = chosen()
-    if is_null(name) { return no_backend_error() }
+    unless type_of(text) == "string" {
+        hint = if type_of(text) == "secret" {
+            "; pass reveal(x) to copy a secret deliberately"
+        } else {
+            ""
+        }
+        error(
+            {
+                kind: "bug",
+                reason: "bad_argument",
+                message: "clipboard.copy: text must be a String, got " + type_of(text) + hint,
+            },
+        )
+    }
+    name = require("copy")
     b = get(backends.COPY, name)
     p = proc.spawn(b.cmd, b.args)
-    io.write(proc.stdin(p), string(text))
-    io.close(proc.stdin(p))
-    # `proc.wait` answers a result map, or null if the tool is somehow still
-    # running after the deadline.
-    r = proc.wait(p, 5000)
-    if is_null(r) { return fail(b.cmd + " did not finish within 5s") }
-    unless r.code == 0 { return fail(b.cmd + " failed writing the clipboard: " + trim(r.stderr)) }
+    input = proc.stdin(p)
+    io.timeout(input, DEADLINE_MS)
+    # A tool that exits early closes its stdin; its exit status and stderr say
+    # why, so the write failing is not the error to report.
+    try {
+        io.write(input, text)
+        io.close(input)
+    } catch { null }
+    r = proc.wait(p, DEADLINE_MS)
+    if r.timed_out {
+        fail("timeout", "clipboard.copy: " + b.cmd + " did not finish within 5s and was killed.")
+    }
+    unless r.code == 0 {
+        fail("tool_failed", "clipboard.copy: " + b.cmd + " failed writing the clipboard: " + why(r))
+    }
     null
 }
 
-## paste() -> the clipboard's contents as text, or "" when it is empty.
+# Whether a failed paste means only that the clipboard is empty: xclip's
+# "target STRING not available", wl-paste's "Nothing is copied" / "No selection".
+fn empty_clipboard(r) {
+    e = r.stderr
+    contains(e, "target ") and contains(e, "not available") or
+        contains(e, "Nothing is copied") or
+        contains(e, "No selection")
+}
+
+## The clipboard's contents as a String, or `""` when it is empty.
 ##
-## Raises kind `clipboard` when no tool is installed.
+## The tool gets 5 seconds; past that it is killed and the call fails.
+## Needs `exec` and `env`.
+##
+## errors: `clipboard`/`no_display` when a Linux session has no display server; `clipboard`/`no_tool` when no clipboard tool is installed; `clipboard`/`tool_failed` when the tool fails for a reason other than an empty clipboard; `clipboard`/`timeout` when it does not finish in 5 seconds.
 ##
 ## example:
-##   clipboard.paste()
+##   clipboard.paste()   # "hello"
 export fn paste() {
-    name = chosen()
-    if is_null(name) { return no_backend_error() }
+    name = require("paste")
     b = get(backends.PASTE, name)
-    r = os.exec(b.cmd, b.args)
-    # An empty X11 clipboard makes xclip exit non-zero with "target STRING not
-    # available" rather than answering nothing, so that is emptiness, not
-    # failure. A real failure has something on stderr worth repeating.
-    unless r.code == 0 {
-        if contains(r.stderr, "target") or trim(r.stderr) == "" { return "" }
-        return fail(b.cmd + " failed: " + trim(r.stderr))
+    r = proc.run(b.cmd, b.args, timeout_ms: DEADLINE_MS)
+    if r.timed_out {
+        fail("timeout", "clipboard.paste: " + b.cmd + " did not finish within 5s and was killed.")
     }
-    r.stdout
+    unless r.code == 0 {
+        if empty_clipboard(r) { return "" }
+        fail(
+            "tool_failed",
+            "clipboard.paste: " + b.cmd + " failed reading the clipboard: " + why(r),
+        )
+    }
+    # PowerShell ends what it prints with a line break that is not clipboard
+    # content.
+    if name == "clip" and ends_with(r.stdout, "\r\n") {
+        r.stdout[0..len(r.stdout) - 2]
+    } else {
+        r.stdout
+    }
 }
